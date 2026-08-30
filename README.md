@@ -32,7 +32,7 @@ tinycbd [-d node] [-i modem.bin] [-n nvdir] <command>
 `nvdir`: `nv_normal.bin` and `nv_protected.bin` from the `efs` partition, and
 `replay_region.bin` from `modem_userdata`.
 
-Defaults are `-d /dev/umts_boot0`, `-n /mnt/nv`.
+Defaults are `-d /dev/umts_boot0`, `-i ./modem.bin`, `-n /mnt/nv`.
 
 ## Building
 

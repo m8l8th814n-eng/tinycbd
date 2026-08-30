@@ -284,7 +284,7 @@ static void usage(const char *argv0)
 		"  nv_normal.bin and nv_protected.bin from the efs partition,\n"
 		"  replay_region.bin from modem_userdata.\n"
 		"\n"
-		"defaults: -d /dev/umts_boot0  -i /home/simon/images/default/modem.bin\n"
+		"defaults: -d /dev/umts_boot0  -i ./modem.bin\n"
 		"          -n /mnt/nv\n",
 		argv0);
 }
@@ -292,7 +292,7 @@ static void usage(const char *argv0)
 int main(int argc, char **argv)
 {
 	const char *node = "/dev/umts_boot0";
-	const char *image = "/home/simon/images/default/modem.bin";
+	const char *image = "./modem.bin";
 	const char *nvdir = "/mnt/nv";
 	struct toc_entry toc[TOC_MAX_ENTRIES];
 	const char *cmd;
