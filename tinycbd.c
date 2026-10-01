@@ -602,6 +602,15 @@ static uint32_t dl_stage(const struct toc_entry *toc, const struct toc_entry *e)
 	return (uint32_t)(e - toc);
 }
 
+/*
+ * Set once the TOC itself has gone over as stage 1 (dload_all). The CP
+ * bootloader keeps its own copy of the TOC and takes each later stage's load
+ * address and size from it; without it MAIN's destination is 0, the first
+ * MAIN frame overwrites the running bootloader and the CP goes silent
+ * (RE/cpboot: fcn.00000de4 stage start, fcn.000018fc data copy).
+ */
+static int toc_sent;
+
 static int dload_toc_section(int fd, const char *image, const char *nvdir,
 			     const struct toc_entry *toc, int ntoc,
 			     const struct toc_entry *e)
@@ -611,7 +620,8 @@ static int dload_toc_section(int fd, const char *image, const char *nvdir,
 	struct stat st;
 	char path[512];
 	uint32_t stage = dl_stage(toc, e);
-	int first = dl_pos(toc, e) == 0;
+	/* int first = dl_pos(toc, e) == 0; */
+	int first = !toc_sent && dl_pos(toc, e) == 0;
 
 	(void)ntoc;
 
@@ -644,6 +654,17 @@ static int dload_all(int fd, const char *image, const char *nvdir,
 		     const struct toc_entry *toc, int ntoc)
 {
 	int i;
+
+	/*
+	 * The TOC goes first, as stage 1 (0xA110): the CP's stage-1 start puts
+	 * the data into its own TOC table (size 800 here), which every later
+	 * stage reads its load address and size from.
+	 */
+	if (ntoc > 0 && strcmp(toc[0].name, "TOC") == 0) {
+		if (dload_section(fd, image, &toc[0], 1, 1) != 0)
+			return -1;
+		toc_sent = 1;
+	}
 
 	for (i = 0; i < ntoc; i++) {
 		if (!is_dload_section(&toc[i]))
