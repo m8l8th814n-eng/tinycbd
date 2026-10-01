@@ -565,6 +565,13 @@ fail:
  * A section is downloaded over the boot channel unless it is the TOC itself,
  * the BOOT bootloader (already uploaded over SPI) or empty.
  */
+/*
+ * The CP bootloader takes data frames for stages 1-7 only (fcn.00000de4:
+ * stage<<4 - 0x10 < 0x70) and NAKs anything later with 0xc1Xf. Stage 8 in
+ * modem.bin is GVERSION, a 32-byte version string stock does not send.
+ */
+#define UDL_MAX_STAGE	7
+
 static int is_dload_section(const struct toc_entry *e)
 {
 	if (strcmp(e->name, "TOC") == 0 || strcmp(e->name, "BOOT") == 0)
@@ -669,6 +676,11 @@ static int dload_all(int fd, const char *image, const char *nvdir,
 	for (i = 0; i < ntoc; i++) {
 		if (!is_dload_section(&toc[i]))
 			continue;
+		if (dl_stage(toc, &toc[i]) > UDL_MAX_STAGE) {
+			printf("%s: stage %u, past the bootloader's last stage, skipped\n",
+			       toc[i].name, dl_stage(toc, &toc[i]));
+			continue;
+		}
 		if (dload_toc_section(fd, image, nvdir, toc, ntoc, &toc[i]) != 0)
 			return -1;
 	}
