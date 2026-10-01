@@ -44,6 +44,94 @@ struct boot_mode {
 #define IOCTL_GET_CP_BOOTLOG		_IO(IOCTL_MAGIC, 0x47)
 #define IOCTL_CLR_CP_BOOTLOG		_IO(IOCTL_MAGIC, 0x48)
 
+#define IOCTL_HANDOVER_BLOCK_INFO	_IO(IOCTL_MAGIC, 0x57)
+
+/*
+ * Handover block, cpif's struct t_handover_block_info (0xa1 bytes). Stock cbd
+ * fills it before powering the CP on (fin.c "Update handover block info",
+ * fcn.0001b5f0 in RE/cbd/handover.c). Its values come from the CDT that ABL
+ * also writes to /chosen/plat, in the order of the cdt_hwid sscanf
+ * (RE/cbd/cdt_hwid.c): platform, product, stage, major, minor, variant,
+ * modem_sku, modem_hw, rf_sub, rf_cfg. cpid[] (IMEI1/2) and cpsig (cpsha) are
+ * left zero on purpose.
+ */
+struct handover_block {
+	uint32_t version;	/* 0x00: 1 */
+	uint32_t project_id;	/* 0x04: platform */
+	uint32_t revision;	/* 0x08: hwinfo, unset here */
+	uint32_t major_id;	/* 0x0c: major */
+	uint16_t minor_id;	/* 0x10: minor */
+	uint16_t pad_minor;
+	uint32_t modem_sku;	/* 0x14: modem_sku */
+	uint16_t modem_hw;	/* 0x18: modem_hw */
+	uint16_t pad_hw;
+	uint32_t cpinfo0;	/* 0x1c: ftm flag, 0 = normal */
+	uint32_t cpinfo1;	/* 0x20: efs clear action, 0 = none */
+	uint32_t cpinfo2;	/* 0x24: modem_flag */
+	uint32_t rf_sub;	/* 0x28: rf_sub */
+	uint32_t rf_config;	/* 0x2c: rfid */
+	uint16_t product;	/* 0x30: reserved[0] */
+	uint16_t pad_product;
+	uint32_t stage;		/* 0x34: reserved[1] */
+	uint16_t variant;	/* 0x38: reserved[2] */
+	uint16_t pad_variant;
+	uint32_t build_magic;	/* 0x3c: reserved[3], userdebug only */
+	char cpid[2][16];	/* 0x40: IMEI1/IMEI2, zero */
+	char cpsig[65];		/* 0x60: cpsha, zero */
+} __attribute__((packed));
+
+_Static_assert(sizeof(struct handover_block) == 0xa1,
+	       "must match cpif struct t_handover_block_info");
+
+#define CHOSEN_PLAT	"/sys/firmware/devicetree/base/chosen/plat/"
+
+/* One big-endian u32 cell from /chosen/plat; 0 when absent. */
+static uint32_t plat_u32(const char *name)
+{
+	char path[128];
+	uint8_t b[4];
+	FILE *f;
+
+	snprintf(path, sizeof(path), CHOSEN_PLAT "%s", name);
+	f = fopen(path, "rb");
+	if (!f)
+		return 0;
+	if (fread(b, 1, 4, f) != 4) {
+		fclose(f);
+		return 0;
+	}
+	fclose(f);
+	return ((uint32_t)b[0] << 24) | ((uint32_t)b[1] << 16) |
+	       ((uint32_t)b[2] << 8) | b[3];
+}
+
+static int send_handover(int fd)
+{
+	struct handover_block hb;
+
+	memset(&hb, 0, sizeof(hb));
+	hb.version = 1;
+	hb.project_id = plat_u32("platform");
+	hb.major_id = plat_u32("major");
+	hb.minor_id = plat_u32("minor");
+	hb.modem_sku = plat_u32("modem_sku");
+	hb.modem_hw = plat_u32("modem_hw");
+	hb.rf_sub = plat_u32("rf_sub");
+	hb.rf_config = plat_u32("rfid");
+	hb.product = plat_u32("product");
+	hb.stage = plat_u32("stage");
+
+	printf("handover: project %u major %u minor %u sku %u hw %u rf_sub %u rf_cfg %u product %u stage %u\n",
+	       hb.project_id, hb.major_id, hb.minor_id, hb.modem_sku,
+	       hb.modem_hw, hb.rf_sub, hb.rf_config, hb.product, hb.stage);
+
+	if (ioctl(fd, IOCTL_HANDOVER_BLOCK_INFO, &hb) < 0) {
+		fprintf(stderr, "IOCTL_HANDOVER_BLOCK_INFO: %s\n", strerror(errno));
+		return -1;
+	}
+	return 0;
+}
+
 #define TOC_ENTRY_SIZE	32
 #define TOC_MAX_ENTRIES	16
 #define SPI_MAX_CHUNK	(128 * 1024)
@@ -63,6 +151,13 @@ struct boot_mode {
  */
 #define UDL_CHUNK	0xC000
 #define UDL_TIMEOUT_MS	3000
+
+/*
+ * Data bytes per std_udl frame, at most UDL_CHUNK. Stock cbd uses 0xC000 and
+ * falls back to 32000 when a frame write fails, so the bootloader takes other
+ * sizes. -c sets it, e.g. to see at which ring offset a download stalls.
+ */
+static uint32_t udl_chunk = UDL_CHUNK;
 
 struct udl_frame {
 	uint16_t cmd;
@@ -296,9 +391,9 @@ static int send_toc_section(int fd, const char *image, const char *nvdir,
 }
 
 /*
- * mask: bits that must match between resp and exp. 0xffff = exact. Data-frame
- * acks come back as 0xc10f where cbd's decompile said 0xc10b, so frame sends
- * use 0xfff0 (ignore low nibble) and log the actual code.
+ * mask: bits that must match between resp and exp. 0xffff = exact, which is
+ * what stock cbd does (std_udl_req_resp compares resp == exp). A 0xc10f after a
+ * data frame is a reject, seen when MAIN was sent as stage 0 (the TOC's stage).
  */
 static int udl_xfer_mask(int fd, uint32_t req, uint32_t exp, uint32_t mask)
 {
@@ -351,11 +446,17 @@ static int udl_send_frame(int fd, struct udl_frame *frm, uint32_t exp)
 		fprintf(stderr, "udl frame write: %s (%zd/%zu)\n", strerror(errno), n, total);
 		return -1;
 	}
-	return udl_xfer_mask(fd, 0, exp, 0xfff0);
+	/* return udl_xfer_mask(fd, 0, exp, 0xfff0); */
+	return udl_xfer_mask(fd, 0, exp, 0xffff);
 }
 
+/*
+ * first: this is the first section of the download. Stock cbd ends that one
+ * with 0xA00B|s -> 0xC00B|s and every later one with 0xA10D|s -> 0xC10D|s
+ * (std_udl_stage_done, the uVar15 != uVar4 split in dload.c).
+ */
 static int dload_section(int fd, const char *path, const struct toc_entry *e,
-			 uint32_t stage)
+			 uint32_t stage, int first)
 {
 	struct udl_frame *frm;
 	FILE *f;
@@ -386,9 +487,10 @@ static int dload_section(int fd, const char *path, const struct toc_entry *e,
 	/*
 	 * The bootloader needs a few seconds after START_CP_BOOTLOADER before it
 	 * answers the very first stage start, and it acks it exactly once. Retry
-	 * only for stage 0 (first contact); later stages it is already up.
+	 * only for the first section (first contact); later stages it is already up.
 	 */
-	if (stage == 0) {
+	/* if (stage == 0) { */
+	if (first) {
 		int try;
 
 		for (try = 0; try < 15; try++) {
@@ -397,8 +499,9 @@ static int dload_section(int fd, const char *path, const struct toc_entry *e,
 			sleep(1);
 		}
 		if (try == 15) {
-			fprintf(stderr, "%s: bootloader never acked stage 0 start\n",
-				e->name);
+			/* fprintf(stderr, "%s: bootloader never acked stage 0 start\n", */
+			fprintf(stderr, "%s: bootloader never acked stage %u start\n",
+				e->name, stage);
 			goto fail;
 		}
 	} else if (udl_xfer(fd, 0xa100 | s, 0xc100 | s) < 0) {
@@ -408,8 +511,10 @@ static int dload_section(int fd, const char *path, const struct toc_entry *e,
 	while (sent < e->size) {
 		uint32_t chunk = e->size - sent;
 
-		if (chunk > UDL_CHUNK)
-			chunk = UDL_CHUNK;
+		/* if (chunk > UDL_CHUNK) */
+		/*	chunk = UDL_CHUNK; */
+		if (chunk > udl_chunk)
+			chunk = udl_chunk;
 		if (fread(frm->data, 1, chunk, f) != chunk) {
 			fprintf(stderr, "%s: short read at %u\n", e->name, sent);
 			goto fail;
@@ -438,8 +543,13 @@ static int dload_section(int fd, const char *path, const struct toc_entry *e,
 			goto fail;
 	}
 
-	if (udl_xfer(fd, 0xa00b | (s & 0x5ff0), 0xc00b | (s & 0x3ff0)) < 0)
+	/* if (udl_xfer(fd, 0xa00b | (s & 0x5ff0), 0xc00b | (s & 0x3ff0)) < 0) */
+	if (first) {
+		if (udl_xfer(fd, 0xa00b | (s & 0x5ff0), 0xc00b | (s & 0x3ff0)) < 0)
+			goto fail;
+	} else if (udl_xfer(fd, 0xa10d | (s & 0x5ef0), 0xc10d | (s & 0x3ef0)) < 0) {
 		goto fail;
+	}
 	printf("%s: stage %u done\n", e->name, stage);
 
 	free(frm);
@@ -465,12 +575,12 @@ static int is_dload_section(const struct toc_entry *e)
 }
 
 /*
- * The bootloader tracks its own download stage counter starting at 0, not the
- * TOC index: it accepts 0xA100 first (proven on device -- 0xA110/0xA120 get no
- * response). So the stage is the position of this section among the downloaded
- * ones (MAIN=0, VSS=1, APM=2, NV_NORM=3, NV_PROT=4, REPLAY=5).
+ * Position of this section among the downloaded ones (MAIN=0, VSS=1, ...).
+ * This used to be sent as the stage, which made MAIN go out as stage 0 -- the
+ * TOC's stage -- and the bootloader rejected its first data frame with 0xc10f.
+ * Now only used to tell which section is the first of the download.
  */
-static uint32_t dl_stage(const struct toc_entry *toc, const struct toc_entry *e)
+static uint32_t dl_pos(const struct toc_entry *toc, const struct toc_entry *e)
 {
 	uint32_t stage = 0;
 	const struct toc_entry *p;
@@ -479,6 +589,17 @@ static uint32_t dl_stage(const struct toc_entry *toc, const struct toc_entry *e)
 		if (is_dload_section(p))
 			stage++;
 	return stage;
+}
+
+/*
+ * The stage is the section's TOC index, as stock cbd numbers it (check_setup
+ * stores the loop index): MAIN=2, VSS=3, APM=4, NV_NORM=5, NV_PROT=6,
+ * REPLAY=7. Proven on device: right after boot 0xA120 -> 0xC120, and 0xA100
+ * then gets no answer.
+ */
+static uint32_t dl_stage(const struct toc_entry *toc, const struct toc_entry *e)
+{
+	return (uint32_t)(e - toc);
 }
 
 static int dload_toc_section(int fd, const char *image, const char *nvdir,
@@ -490,6 +611,7 @@ static int dload_toc_section(int fd, const char *image, const char *nvdir,
 	struct stat st;
 	char path[512];
 	uint32_t stage = dl_stage(toc, e);
+	int first = dl_pos(toc, e) == 0;
 
 	(void)ntoc;
 
@@ -499,7 +621,7 @@ static int dload_toc_section(int fd, const char *image, const char *nvdir,
 				e->name);
 			return -1;
 		}
-		return dload_section(fd, image, e, stage);
+		return dload_section(fd, image, e, stage, first);
 	}
 
 	snprintf(path, sizeof(path), "%s/%s", nvdir, nvfile);
@@ -515,7 +637,7 @@ static int dload_toc_section(int fd, const char *image, const char *nvdir,
 	nv = *e;
 	nv.offset = 0;
 	printf("%s: from %s\n", e->name, path);
-	return dload_section(fd, path, &nv, stage);
+	return dload_section(fd, path, &nv, stage, first);
 }
 
 static int dload_all(int fd, const char *image, const char *nvdir,
@@ -549,7 +671,7 @@ static int complete_bootup(int fd)
 static void usage(const char *argv0)
 {
 	fprintf(stderr,
-		"usage: %s [-d node] [-i modem.bin] [-n nvdir] <command>\n"
+		"usage: %s [-c chunk] [-d node] [-i modem.bin] [-n nvdir] <command>\n"
 		"\n"
 		"  toc            list the sections in the image\n"
 		"  boot           upload BOOT and start the CP bootloader\n"
@@ -559,7 +681,9 @@ static void usage(const char *argv0)
 		"  req <hex> <hex> send one std_udl code and expect one (probe)\n"
 		"  finish         std_udl finish handshake (0xA400 -> 0xC400)\n"
 		"  complete       IOCTL_COMPLETE_NORMAL_BOOTUP\n"
-		"  full           boot + dloadall + finish + complete\n"
+		"  bootlog        dump the CP bootloader's log to dmesg\n"
+		"  handover       IOCTL_HANDOVER_BLOCK_INFO from /chosen/plat\n"
+		"  full           handover + boot + dloadall + finish + complete\n"
 		"  status         query CP status\n"
 		"  poweron        IOCTL_POWER_ON\n"
 		"  poweroff       IOCTL_POWER_OFF\n"
@@ -567,6 +691,8 @@ static void usage(const char *argv0)
 		"NV_NORM, NV_PROT and REPLAY come from nvdir, not from the image:\n"
 		"  nv_normal.bin and nv_protected.bin from the efs partition,\n"
 		"  replay_region.bin from modem_userdata.\n"
+		"\n"
+		"-c: data bytes per std_udl frame, max 0xC000 (default)\n"
 		"\n"
 		"defaults: -d /dev/umts_boot0  -i ./modem.bin\n"
 		"          -n /mnt/nv\n",
@@ -585,8 +711,15 @@ int main(int argc, char **argv)
 	int opt;
 	int rc = 1;
 
-	while ((opt = getopt(argc, argv, "d:i:n:h")) != -1) {
+	while ((opt = getopt(argc, argv, "c:d:i:n:h")) != -1) {
 		switch (opt) {
+		case 'c':
+			udl_chunk = strtoul(optarg, NULL, 0);
+			if (udl_chunk == 0 || udl_chunk > UDL_CHUNK) {
+				fprintf(stderr, "-c must be 1..%u\n", UDL_CHUNK);
+				return 1;
+			}
+			break;
 		case 'd':
 			node = optarg;
 			break;
@@ -685,6 +818,15 @@ int main(int argc, char **argv)
 			printf("finish handshake ok\n");
 	} else if (strcmp(cmd, "complete") == 0) {
 		rc = complete_bootup(fd) != 0;
+	} else if (strcmp(cmd, "handover") == 0) {
+		rc = send_handover(fd) != 0;
+	} else if (strcmp(cmd, "bootlog") == 0) {
+		/* cpif prints the CP bootloader's shmem log to dmesg */
+		rc = ioctl(fd, IOCTL_GET_CP_BOOTLOG) < 0;
+		if (rc)
+			fprintf(stderr, "IOCTL_GET_CP_BOOTLOG: %s\n", strerror(errno));
+		else
+			printf("CP boot log printed to dmesg\n");
 	} else if (strcmp(cmd, "full") == 0) {
 		const struct toc_entry *e = toc_find(toc, ntoc, "BOOT");
 		struct boot_mode mode = { .idx = CP_BOOT_MODE_NORMAL };
@@ -693,6 +835,9 @@ int main(int argc, char **argv)
 			fprintf(stderr, "no BOOT section in %s\n", image);
 			goto out;
 		}
+		/* stock cbd: "Update handover block info", then "Power on CP" */
+		if (send_handover(fd) != 0)
+			goto out;
 		if (ioctl(fd, IOCTL_POWER_ON) < 0) {
 			fprintf(stderr, "IOCTL_POWER_ON: %s\n", strerror(errno));
 			goto out;
