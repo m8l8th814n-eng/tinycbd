@@ -107,6 +107,32 @@ def show(buf, secret=False):
           f'got={len(buf)}', flush=True)
     # txt = '<payload hidden>' if secret else mask(body).strip('.')[:60]
     hexdump(body, secret)
+    decode(typ, mid, buf)
+
+
+# RIL_RegState values (reg state byte of GET_CS/PS_REG_STATE)
+REG = {0: 'not registered, not searching', 1: 'registered, home',
+       2: 'searching', 3: 'registration denied', 4: 'unknown',
+       5: 'registered, roaming', 10: 'emergency only (not searching)',
+       12: 'emergency only (searching)', 13: 'emergency only (denied)',
+       14: 'emergency only (unknown)'}
+
+
+def decode(typ, mid, buf):
+    # field offsets from ProtocolNet{Voice,Data}RegStateAdapter in
+    # vendor.radio.protocol.sit.stream.so (offsets from frame start)
+    if typ == 1 and mid == 0x0700 and len(buf) >= 0x11:
+        st, rej, rat = buf[0xc], buf[0xd], buf[0xe]
+        lac = int.from_bytes(buf[0xf:0x11], 'little')
+        print(f'    = CS: {REG.get(st, st)}, reject cause {rej}, rat {rat}, lac 0x{lac:x}')
+    elif typ == 1 and mid == 0x0701 and len(buf) >= 0x12:
+        st, rej, rat = buf[0xc], buf[0xd], buf[0xf]
+        lac = int.from_bytes(buf[0x10:0x12], 'little')
+        print(f'    = PS: {REG.get(st, st)}, reject cause {rej}, rat {rat}, lac 0x{lac:x}')
+    elif typ == 1 and mid == 0x0801 and len(buf) >= 0xd:
+        print('    = radio state', buf[0xc])
+    elif typ == 2 and mid == 0x0802 and len(buf) >= 0x9:
+        print('    = radio state', buf[0x8], {0: '(off)', 2: '(on)'}.get(buf[0x8], ''))
 
 
 def run(frame, wait=5.0, secret=False):
