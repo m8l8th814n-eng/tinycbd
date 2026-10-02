@@ -8,8 +8,9 @@
 # len is the whole frame including the header, little endian throughout.
 #
 # Usage (as root, with modemlisten.py stopped so it does not eat replies):
-#   sitctl.py listen        (reads umts_ipc0 and umts_ipc1)
-#   SIT_DEV=/dev/umts_ipc1 sitctl.py ...   send on slot 1
+#   sitctl.py listen         (all modem channels, header + hexdump)
+#   sitctl.py -s 0 ...       send on SIM slot 0 (umts_ipc0); default slot 1
+#   SIT_DEV=/dev/xxx sitctl.py ...   send on any channel
 #   sitctl.py radio on|off
 #   sitctl.py pin            (prompts for the PIN, never echoed or printed)
 #   sitctl.py reg
@@ -19,9 +20,15 @@
 import getpass, os, re, select, struct, sys, time
 
 # One RIL instance per SIM slot: umts_ipc0 / umts_ipc1. The physical SIM
-# reported its ICCID/IMSI on umts_ipc1 here. Pick with SIT_DEV=/dev/umts_ipc1.
-DEV = os.environ.get('SIT_DEV', '/dev/umts_ipc0')
-LISTEN_DEVS = ['/dev/umts_ipc0', '/dev/umts_ipc1']
+# answers on umts_ipc1 (SET_RADIO_POWER err=0, 2026-10-02), so slot 1 is the
+# default. -s 0|1 or SIT_DEV=/dev/... picks the channel requests go out on.
+# DEV = os.environ.get('SIT_DEV', '/dev/umts_ipc0')
+DEV = os.environ.get('SIT_DEV', '/dev/umts_ipc1')
+# LISTEN_DEVS = ['/dev/umts_ipc0', '/dev/umts_ipc1']
+# Everything the CP sends to userspace; channels that do not exist or cannot
+# be opened are skipped. Only the umts_ipc ones carry SIT.
+SIT_DEVS = ['/dev/umts_ipc0', '/dev/umts_ipc1']
+LISTEN_DEVS = SIT_DEVS + ['/dev/umts_rfs0'] + [f'/dev/oem_ipc{i}' for i in range(8)]
 
 NAMES = {
     0x0001: 'SIT_DIAL', 0x0004: 'SIT_ANSWER', 0x0008: 'SIT_HANGUP',
@@ -60,6 +67,28 @@ def request(msg_id, payload=b''):
     return struct.pack('<HHHHI', 0, msg_id, length, _token, 0) + payload
 
 
+SHOW_PRIVATE = os.environ.get('SIT_PRIVATE') == '1'
+
+
+def hexdump(buf, secret=False):
+    if secret:
+        print('    <payload hidden>')
+        return
+    if not SHOW_PRIVATE:
+        # ICCID/IMSI/MSISDN as ASCII digit runs: blank them over the whole
+        # buffer, not per 16-byte row (a row split leaked them). Shown in
+        # both columns as '*'. SIT_PRIVATE=1 shows them.
+        buf = re.sub(rb'[0-9]{9,}', lambda m: b'*' * len(m.group()), bytes(buf))
+    for o in range(0, len(buf), 16):
+        chunk = buf[o:o + 16]
+        print(f'    {o:04x}  {chunk.hex(" "):<47}  {mask(chunk)}')
+
+
+def show_raw(dev, buf):
+    print(time.strftime('%T'), dev, f'raw len={len(buf)}', flush=True)
+    hexdump(buf)
+
+
 def show(buf, secret=False):
     if len(buf) < 8:
         print('short', buf.hex(' '))
@@ -74,14 +103,23 @@ def show(buf, secret=False):
         body = buf[12:]
         extra = f' token={tok} err={err}'
     txt = '<payload hidden>' if secret else mask(body).strip('.')[:60]
-    print(time.strftime('%T'), kind, name(mid), f'len={ln}{extra}', txt, flush=True)
+    print(time.strftime('%T'), kind, name(mid), f'(0x{mid:04x}) len={ln}{extra}',
+          f'got={len(buf)}', flush=True)
+    # txt = '<payload hidden>' if secret else mask(body).strip('.')[:60]
+    hexdump(body, secret)
 
 
 def run(frame, wait=5.0, secret=False):
     # write on DEV, but read replies and indications from both slots
     fds = {}
-    for d in LISTEN_DEVS:
-        fds[os.open(d, os.O_RDWR | os.O_NONBLOCK)] = os.path.basename(d)
+    for d in LISTEN_DEVS + ([DEV] if DEV not in LISTEN_DEVS else []):
+        try:
+            fds[os.open(d, os.O_RDWR | os.O_NONBLOCK)] = os.path.basename(d)
+        except OSError as e:
+            if d == DEV:
+                raise
+            print('skip', d, e.strerror)
+    print('listening on', ' '.join(sorted(fds.values())), flush=True)
     tx = next(fd for fd, n in fds.items() if n == os.path.basename(DEV))
     if frame:
         print('->', os.path.basename(DEV), end=' ')
@@ -93,50 +131,76 @@ def run(frame, wait=5.0, secret=False):
     end = time.time() + wait
     while wait < 0 or time.time() < end:
         for fd, ev in p.poll(500):
+            if ev & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+                # cpif reports HUP once the CP leaves ONLINE (CRASH_EXIT)
+                print(time.strftime('%T'), fds[fd], 'hung up (modem not ONLINE)')
+                return
             try:
                 data = os.read(fd, 65536)
             except BlockingIOError:
                 continue
-            if data:
+            if not data:
+                continue
+            if '/dev/' + fds[fd] in SIT_DEVS:
                 print('<-', fds[fd], end=' ')
                 show(data)
+            else:
+                print('<-', end=' ')
+                show_raw(fds[fd], data)
 
 
-def main():
-    if len(sys.argv) < 2:
-        print(__doc__ if __doc__ else open(__file__).read().split('\nimport')[0])
-        sys.exit(1)
-    cmd = sys.argv[1]
-    if cmd == 'listen':
-        run(None, wait=-1)
-    elif cmd == 'radio':
-        on = len(sys.argv) > 2 and sys.argv[2] == 'on'
+def build(args, getpin=None):
+    """args like ['radio', 'on'] -> (frame, secret, wait); shared with modemctl.py"""
+    cmd = args[0]
+    if cmd == 'radio':
+        on = len(args) > 1 and args[1] == 'on'
         # ProtocolRadioPowerBuilder::BuildRadioPower: u32 1=off 2=on, u8, u8
-        run(request(0x0800, struct.pack('<IBB', 2 if on else 1, 0, 0)))
-    elif cmd == 'pin':
-        pin = getpass.getpass('PIN: ').encode()[:8]
+        return request(0x0800, struct.pack('<IBB', 2 if on else 1, 0, 0)), False, 5
+    if cmd == 'pin':
+        pin = (getpin or (lambda: getpass.getpass('PIN: ')))().encode()[:8]
         # BuildSimVerifyPin: u8 pin_len, pin[8], u8 aid_len, aid[16]
         payload = bytes([len(pin)]) + pin.ljust(8, b'\0') + bytes([0]) + bytes(16)
-        run(request(0x0201, payload), secret=True)
-    elif cmd == 'reg':
-        run(request(0x0700))
-    elif cmd == 'dial':
-        num = sys.argv[2].encode()[:0x52]
+        return request(0x0201, payload), True, 5
+    if cmd == 'reg':
+        return request(0x0700), False, 5
+    if cmd == 'psreg':
+        return request(0x0701), False, 5
+    if cmd == 'radiostate':
+        return request(0x0801), False, 5
+    if cmd == 'dial':
+        num = args[1].encode()[:0x52]
         # BuildDial: u8 calltype (voice=1), u8 a, u8 numlen, num[0x52],
         # u8 0, u8 ton (0x10 '+', else 0x20), u8 1, u8 clir (0xff default),
         # u16 0, u8 0, u8 b
         payload = bytes([1, 0, len(num)]) + num.ljust(0x51, b'\0')
         payload += bytes([0, 0x10 if num.startswith(b'+') else 0x20, 1, 0xff, 0, 0, 0, 0])
         assert 12 + len(payload) == 0x68
-        run(request(0x0001, payload), wait=15)
-    elif cmd == 'answer':
-        run(request(0x0004))
-    elif cmd == 'hangup':
+        return request(0x0001, payload), False, 15
+    if cmd == 'answer':
+        return request(0x0004), False, 5
+    if cmd == 'hangup':
         # BuildHangup: u32 call id, u32 1
-        run(request(0x0008, struct.pack('<II', int(sys.argv[2]), 1)))
-    else:
-        print('unknown command', cmd)
+        return request(0x0008, struct.pack('<II', int(args[1]), 1)), False, 5
+    raise ValueError(f'unknown command {cmd}')
+
+
+def main():
+    global DEV
+    if len(sys.argv) > 2 and sys.argv[1] == '-s':
+        DEV = f'/dev/umts_ipc{int(sys.argv[2])}'
+        del sys.argv[1:3]
+    if len(sys.argv) < 2:
+        print(__doc__ if __doc__ else open(__file__).read().split('\nimport')[0])
         sys.exit(1)
+    if sys.argv[1] == 'listen':
+        run(None, wait=-1)
+        return
+    try:
+        frame, secret, wait = build(sys.argv[1:])
+    except (ValueError, IndexError) as e:
+        print(e)
+        sys.exit(1)
+    run(frame, wait=wait, secret=secret)
 
 
 if __name__ == '__main__':
