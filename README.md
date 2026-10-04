@@ -1,4 +1,4 @@
-
+# You need sit_ids.txt wich is reversed from libsit and libril. I might push it here.
 
 ```
 blkid | grep -E 'modem_a|efs|modem_userdata'
