@@ -52,8 +52,8 @@ struct boot_mode {
  * fcn.0001b5f0 in RE/cbd/handover.c). Its values come from the CDT that ABL
  * also writes to /chosen/plat, in the order of the cdt_hwid sscanf
  * (RE/cbd/cdt_hwid.c): platform, product, stage, major, minor, variant,
- * modem_sku, modem_hw, rf_sub, rf_cfg. cpid[] (IMEI1/2) and cpsig (cpsha) are
- * left zero on purpose.
+ * modem_sku, modem_hw, rf_sub, rf_cfg. cpid[] gets IMEI1/2 and cpsig the persist
+ * partition's modem/cpsha, like stock cbd.
  */
 struct handover_block {
 	uint32_t version;	/* 0x00: 1 */
@@ -105,7 +105,47 @@ static uint32_t plat_u32(const char *name)
 	       ((uint32_t)b[2] << 8) | b[3];
 }
 
-static int send_handover(int fd)
+/* Stock cbd copies the raw 16-byte /chosen/config/imei1 and imei2 (15 digits + NUL) into cpid */
+static int plat_imei(const char *name, char *dst)
+{
+	char path[128];
+	FILE *f;
+	size_t n;
+
+	snprintf(path, sizeof(path), "/sys/firmware/devicetree/base/chosen/config/%s", name);
+	f = fopen(path, "rb");
+	if (!f)
+		return 0;
+	n = fread(dst, 1, 16, f);
+	fclose(f);
+	if (n != 16) {
+		memset(dst, 0, 16);
+		return 0;
+	}
+	return 1;
+}
+
+/* 64 hex characters, from the persist partition's modem/cpsha */
+static int read_cpsha(const char *nvdir, char *dst)
+{
+	char path[256];
+	FILE *f;
+	size_t n;
+
+	snprintf(path, sizeof(path), "%s/cpsha", nvdir);
+	f = fopen(path, "rb");
+	if (!f)
+		return 0;
+	n = fread(dst, 1, 64, f);
+	fclose(f);
+	if (n != 64) {
+		memset(dst, 0, 64);
+		return 0;
+	}
+	return 1;
+}
+
+static int send_handover(int fd, const char *nvdir)
 {
 	struct handover_block hb;
 
@@ -120,6 +160,8 @@ static int send_handover(int fd)
 	hb.rf_config = plat_u32("rfid");
 	hb.product = plat_u32("product");
 	hb.stage = plat_u32("stage");
+	printf("handover: imei1 %s, imei2 %s, cpsha %s\n", plat_imei("imei1", hb.cpid[0]) ? "set" : "missing",
+	       plat_imei("imei2", hb.cpid[1]) ? "set" : "missing", read_cpsha(nvdir, hb.cpsig) ? "set" : "missing");
 
 	printf("handover: project %u major %u minor %u sku %u hw %u rf_sub %u rf_cfg %u product %u stage %u\n",
 	       hb.project_id, hb.major_id, hb.minor_id, hb.modem_sku,
@@ -852,7 +894,7 @@ int main(int argc, char **argv)
 	} else if (strcmp(cmd, "complete") == 0) {
 		rc = complete_bootup(fd) != 0;
 	} else if (strcmp(cmd, "handover") == 0) {
-		rc = send_handover(fd) != 0;
+		rc = send_handover(fd, nvdir) != 0;
 	} else if (strcmp(cmd, "bootlog") == 0) {
 		/* cpif prints the CP bootloader's shmem log to dmesg */
 		rc = ioctl(fd, IOCTL_GET_CP_BOOTLOG) < 0;
@@ -869,7 +911,7 @@ int main(int argc, char **argv)
 			goto out;
 		}
 		/* stock cbd: "Update handover block info", then "Power on CP" */
-		if (send_handover(fd) != 0)
+		if (send_handover(fd, nvdir) != 0)
 			goto out;
 		if (ioctl(fd, IOCTL_POWER_ON) < 0) {
 			fprintf(stderr, "IOCTL_POWER_ON: %s\n", strerror(errno));
